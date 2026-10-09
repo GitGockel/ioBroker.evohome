@@ -1,1 +1,51 @@
+/* Style your widget here */
+.vistaragorm-class {
+    font-style: italic;
+}
+
+table.vis_evohome-table  {
+    border:solid black 1px;
+    border-radius:6px;
+/*    padding: 3px; */
+}
+
+.vis_evohome-table th {
+    text-align: center;
+}
+
+.vis_evohome-table td {
+    text-align: center;
+}
+
+
+.vis_evohome-set {
+    cursor: pointer;
+}
+
+.vis_evohome-err {
+    cursor: pointer;
+    background:white;
+    color:red;
+}
+
+a:link.noul {
+    text-decoration: none;
+}
+
+a:visited.noul {
+    text-decoration: none;
+}
+
+a:hover.noul {
+    text-decoration: underline;
+}
+
+a:active.noul {
+    text-decoration: underline;
+}
+
+.custom-handle {
+    width: 4em !important;
+    text-align: center;
+}
 
