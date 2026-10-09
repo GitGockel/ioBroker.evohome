@@ -81,7 +81,7 @@ class Evo {
         
         var options = {
             method: 'POST',
-            uri: 'https://tccna.honeywell.com/Auth/OAuth/Token',
+            uri: 'https://tccna.resideo.com/Auth/OAuth/Token',
             headers: {
                 'User-Agent': 'Request-Promise',
                 'Authorization': 'Basic NGEyMzEwODktZDJiNi00MWJkLWE1ZWItMTZhMGE0MjJiOTk5OjFhMTVjZGI4LTQyZGUtNDA3Yi1hZGQwLTA1OWY5MmM1MzBjYg==',
