@@ -20,7 +20,7 @@ assert = require("assert");
 sprintf = require("sprintf-js");
 
 
-HONEYWELL = 'https://rs.alarmnet.com/TC2API/';
+HONEYWELL = 'https://rs.alarmnet.com/TC2API/TC2.asmx';
 APPID = '91db1612-73fd-4500-91b2-e63b069b185c';
 HOST = "rs.alarmnet.com";
 
