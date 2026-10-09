@@ -1,933 +1,605 @@
 /** @file
- * @brief Evohome support module
- * 
- * Inspiration/examples taken from evohomeclient2
- * 
- * At present support is limited to: 
- * - reading the hardware configuration
- * - reading the status
- * - writing the system state
- * - Only heating zones supported [I don't have anything else to test vs]
- * - Writing setpoints
- * - Reading schedules
- * 
- * Future:
- *  - Writing schedules
- *  
+ * Evohome / Total Connect Comfort EMEA client.
+ *
+ * Notes:
+ * - Uses the Resideo EMEA REST API, not the legacy TC2 SOAP endpoint.
+ * - The OAuth password grant and legacy EMEA routes may no longer be
+ *   supported for every account. Configure the endpoints for your service.
+ * - Never log or publish credentials, client secrets, or access tokens.
  */
-req = require('request-promise-native');
-assert = require("assert");
-sprintf = require("sprintf-js");
+'use strict';
 
+const req = require('request-promise-native');
+const assert = require('assert');
+const sprintf = require('sprintf-js');
 
-HONEYWELL = 'https://rs.alarmnet.com/TC2API/TC2.asmx';
-APPID = '91db1612-73fd-4500-91b2-e63b069b185c';
-HOST = "rs.alarmnet.com";
+const API_BASE = (process.env.EVOHOME_API_BASE || 'https://tccna.resideo.com').replace(/\/+$/, '');
+const TOKEN_URL = process.env.EVOHOME_TOKEN_URL || `${API_BASE}/Auth/OAuth/Token`;
+const APPID = process.env.EVOHOME_APP_ID || '91db1612-73fd-4500-91b2-e63b069b185c';
+const CLIENT_CREDENTIALS = process.env.EVOHOME_CLIENT_CREDENTIALS ||
+    'NGEyMzEwODktZDJiNi00MWJkLWE1ZWItMTZhMGE0MjJiOTk5OjFhMTVjZGI4LTQyZGUtNDA3Yi1hZGQwLTA1OWY5MmM1MzBjYg==';
+const API_PREFIX = process.env.EVOHOME_API_PREFIX || '/WebAPI/emea/api/v1';
 
-class BadStructure extends Error {};
+class BadStructure extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'BadStructure';
+    }
+}
+
+function apiUrl(path) {
+    return `${API_BASE}${API_PREFIX}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+function responseMessage(error) {
+    const status = error && error.statusCode ? `HTTP ${error.statusCode}` : 'Request failed';
+    let body = error && error.error;
+    if (body && typeof body !== 'string') {
+        try { body = JSON.stringify(body); } catch (_) { body = String(body); }
+    }
+    if (typeof body === 'string') body = body.slice(0, 1200);
+    return `${status}: ${body || (error && error.message) || 'Unknown error'}`;
+}
 
 class Evo {
-    
-    //--------------------------------------------------------
-    /**
-     * Make Evohome connector
-     * @param {string} user   Username
-     * @param {string} pass   User password
-     * @param {string} appId  Application ID (optional) - Not sure what this is for
-     * @returns {nm$_evo.Evo}
-     */
-    constructor(user, pass, appId ) {
+    constructor(user, pass, appId) {
         this.username = user;
-        this.password = pass;    
+        this.password = pass;
         this.appId = appId || APPID;
         this.installation = undefined;
         this.userAccount = undefined;
         this.access_token = undefined;
         this.access_token_expires = undefined;
         this.system = undefined;
-        this.label = "EVO";
+        this.label = 'EVO';
         this.log = console;
-
-        /**
-         * async (event) when a command is sent
-         */
         this.onCommand = undefined;
+        this.structureError = '';
+        this._headers = undefined;
     }
-    //--------------------------------------------------------
-    /**
-     * Create a pristine daily schedule
-     */
+
     static createDailySchedule() {
         return new DailySchedule();
     }
-    //--------------------------------------------------------
-    /**
-     * Convert a date/time to iso string format
-     * @param {*} d 
-     */
-    static toDateTimeString(d) {
-        
-        if(!d || typeof d == "string")
-            return d;
 
+    static toDateTimeString(d) {
+        if (!d || typeof d === 'string') return d;
         return d.toISOString();
     }
-    //--------------------------------------------------------
-    /**
-     * Get an access token, and build our common headers
-     * @returns {nm$_evo.exports.basicLogin.resp|nm$_evo.Evo.basicLogin.resp}
-     */
-    async _basicLogin() {
-        
-        var options = {
-            method: 'POST',
-            uri: 'https://tccna.resideo.com/Auth/OAuth/Token',
-            headers: {
-                'User-Agent': 'Request-Promise',
-                'Authorization': 'Basic NGEyMzEwODktZDJiNi00MWJkLWE1ZWItMTZhMGE0MjJiOTk5OjFhMTVjZGI4LTQyZGUtNDA3Yi1hZGQwLTA1OWY5MmM1MzBjYg==',
-                'Accept': 'application/json, application/xml, text/json, text/x-json, text/javascript, text/xml'
-            },
-            form: {
-                'Content-Type':	'application/x-www-form-urlencoded; charset=utf-8',
-                'Host':	HOST,
-                'Cache-Control':'no-store no-cache',
-                'Pragma':	'no-cache',
-                'grant_type':	'password',
-                'scope':	'EMEA-V1-Basic EMEA-V1-Anonymous EMEA-V1-Get-Current-User-Account',
-                'Username':	this.username,
-                'Password':	this.password,
-                'Connection':	'Keep-Alive'            
-            },
-            json: true // Automatically parses the JSON string in the response
-        };      
-        
-        let resp = await req(options);
-        this.access_token = resp.access_token;
-        var d = new Date();
-        d.setSeconds(d.getSeconds() + resp.expires_in -30 ); // offset a smidge
-        this.access_token_expires = d;
-        this._headers = {
-            'Authorization': 'bearer ' + this.access_token,
-            'Accept': 'application/json, application/xml, text/json, text/x-json, text/javascript, text/xml'            
-        };
-        return resp;
-    }
-    //--------------------------------------------------------
-    /**
-     * Get user account data
-     * @returns {unresolved}
-     */
-    async getUserAccount()
-    {
-        this.userAccount = await req({
-            method:'GET',
-            uri: HONEYWELL + "WebApi/emea/api/v1/userAccount",
-            headers: await this.headers(),
-            json: true
-        });
-        //console.log(JSON.stringify(this.userAccount));
-        return this.userAccount;
-    }
-    //--------------------------------------------------------
-    /**
-     * get headers, recreating the access token as required.
-     * @returns {nm$_evo.Evo._headers}
-     */
-    async headers(json) {
-        if(
-                !this.access_token
-                || !this.access_token_expires
-                || new Date() > this.access_token_expires
-        ) await this._basicLogin()
 
-        if(json) {
-            let h = Object.assign({}, this._headers);
-            h['Content-Type'] = 'application/json';
-            return h;
+    async _basicLogin() {
+        if (!this.username || !this.password) {
+            throw new Error('Evohome: Username und Passwort müssen gesetzt sein.');
         }
 
-        return this._headers;
-    }    
-    //--------------------------------------------------------
-    async getInstallation()
-    {
-        let uri = HONEYWELL + `WebApi/emea/api/v1/location/installationInfo?userId=${this.userAccount.userId}&includeTemperatureControlSystems=True`;
-        //console.log(uri);
-        this.installation = await req({
-            method:'GET',
-            uri: uri,
-            headers: await this.headers(),
-            json: true
+        const options = {
+            method: 'POST',
+            uri: TOKEN_URL,
+            headers: {
+                'User-Agent': 'EvohomeClient/1.0',
+                'Authorization': `Basic ${CLIENT_CREDENTIALS}`,
+                'Accept': 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+                'Cache-Control': 'no-store',
+                'Pragma': 'no-cache'
+            },
+            form: {
+                grant_type: 'password',
+                scope: 'EMEA-V1-Basic EMEA-V1-Anonymous EMEA-V1-Get-Current-User-Account',
+                Username: this.username,
+                Password: this.password
+            },
+            json: true,
+            resolveWithFullResponse: true,
+            simple: true,
+            timeout: 20000
+        };
+
+        let response;
+        try {
+            response = await req(options);
+        } catch (error) {
+            throw new Error(`Evohome OAuth-Login fehlgeschlagen (${responseMessage(error)}). ` +
+                `Token-URL: ${TOKEN_URL}. Prüfe, ob dieser Token-Endpunkt für dein Konto noch unterstützt wird.`);
+        }
+
+        const body = response.body;
+        if (!body || !body.access_token) {
+            throw new Error('Evohome OAuth-Login: Antwort enthält kein access_token.');
+        }
+
+        this.access_token = body.access_token;
+        const expiresIn = Number(body.expires_in) || 3600;
+        this.access_token_expires = new Date(Date.now() + Math.max(0, expiresIn - 30) * 1000);
+        this._headers = {
+            Authorization: `Bearer ${this.access_token}`,
+            Accept: 'application/json, application/xml, text/json, text/x-json, text/javascript, text/xml'
+        };
+        return body;
+    }
+
+    async headers(json) {
+        if (!this.access_token || !this.access_token_expires ||
+            Date.now() >= this.access_token_expires.getTime()) {
+            await this._basicLogin();
+        }
+        const headers = Object.assign({}, this._headers);
+        if (json) headers['Content-Type'] = 'application/json';
+        return headers;
+    }
+
+    async _api(options) {
+        const opts = Object.assign({
+            json: true,
+            timeout: 20000,
+            resolveWithFullResponse: false
+        }, options);
+        try {
+            return await req(opts);
+        } catch (error) {
+            throw new Error(`Evohome API ${opts.method || 'GET'} ${opts.uri} fehlgeschlagen: ${responseMessage(error)}`);
+        }
+    }
+
+    async getUserAccount() {
+        this.userAccount = await this._api({
+            method: 'GET',
+            uri: apiUrl('/userAccount'),
+            headers: await this.headers()
         });
-        
-        //
-        // Fixup the installation objects 
-     
-        for(let i=0; i<this.installation.length; ++i) {
-            //this.log.info(`Loc ${i}`);
-            let loc = new Location(this, this.installation[i]);
+        return this.userAccount;
+    }
+
+    async getInstallation() {
+        if (!this.userAccount || !this.userAccount.userId) {
+            throw new Error('Evohome: getUserAccount() muss vor getInstallation() erfolgreich sein.');
+        }
+        const uri = apiUrl(`/location/installationInfo?userId=${encodeURIComponent(this.userAccount.userId)}&includeTemperatureControlSystems=True`);
+        this.installation = await this._api({
+            method: 'GET',
+            uri,
+            headers: await this.headers()
+        });
+
+        if (!Array.isArray(this.installation)) {
+            throw new Error('Evohome: Unerwartetes Installationsformat (erwartet wurde ein Array).');
+        }
+
+        this.system = undefined;
+        for (let i = 0; i < this.installation.length; ++i) {
+            const loc = new Location(this, this.installation[i]);
             this.installation[i] = loc;
-            for(let j=0; j<loc.gateways.length; ++j) {
-                //this.log.info(`  Gate ${j}`);
-                let gate = new Gateway(loc, loc.gateways[j]);
-                loc.gateways[j] = gate;
-                for(let k=0; k<gate.temperatureControlSystems.length; ++k) {
-                    //this.log.info(`    System ${k}`);
-                    let sys = new TemperatureControlSystem(gate, gate.temperatureControlSystems[k]);
-                    gate.temperatureControlSystems[k] = sys;
-                    for(let l=0; l<sys.zones.length; ++l) {
-                        let zn = sys.makeZoneObject(l);
-                        sys.zones[l] = zn;
-                        //this.log.info(`        zn ${l} ${zn.name}`);
+            for (let j = 0; j < (loc.gateways || []).length; ++j) {
+                const gateway = new Gateway(loc, loc.gateways[j]);
+                loc.gateways[j] = gateway;
+                for (let k = 0; k < (gateway.temperatureControlSystems || []).length; ++k) {
+                    const system = new TemperatureControlSystem(gateway, gateway.temperatureControlSystems[k]);
+                    gateway.temperatureControlSystems[k] = system;
+                    for (let l = 0; l < (system.zones || []).length; ++l) {
+                        system.zones[l] = system.makeZoneObject(l);
                     }
-                    
-                    if(this.system===undefined) {
-                        this.system = sys;
-                    } else {
-                        this.system = null; // second instance causes single instance to be reset
-                    }
+                    if (this.system === undefined) this.system = system;
+                    else this.system = null;
                 }
             }
         }
-        this.structureError = "";
+        this.structureError = '';
         return this.installation;
     }
-    //--------------------------------------------------------
+
     async login() {
         await this._basicLogin();
         await this.getUserAccount();
         await this.getInstallation();
         return this.installation;
     }
-    //--------------------------------------------------------
-    async getStatus() {
-        
-        var status;
-        for(let loc of this.installation) {
-            status = await loc.getStatus();
+
+    async getStatus(quick) {
+        if (!Array.isArray(this.installation)) {
+            throw new Error('Evohome: Erst login() aufrufen.');
         }
+        let status;
+        for (const location of this.installation) status = await location.getStatus(quick);
         return status;
     }
-    //--------------------------------------------------------
-    userId()
-    {
-        return this.userAccount.userId;
+
+    userId() {
+        return this.userAccount && this.userAccount.userId;
     }
-    //--------------------------------------------------------
+
     setStructureError(err) {
-        if(!this.structureError)
-            this.structureError = err;
+        if (!this.structureError) this.structureError = err;
     }
-    //--------------------------------------------------------
+
     *locations() {
-     for(let loc of this.installation)
-         yield loc;
+        for (const location of (this.installation || [])) yield location;
     }
-    //--------------------------------------------------------
-};
-//============================================================
-/**
- * Wrap location object with some methods
- */
-class Location  {    
-    constructor(evo, pjso) {
-        Object.assign(this, pjso);
-        // $ prefix allows us to filter refs out
+}
+
+class Location {
+    constructor(evo, data) {
+        Object.assign(this, data);
         this.$evo = evo;
-        this.label = "LOCATION";        
-        assert(pjso.gateways !== undefined );
-        assert(this.gateways !== undefined );
-        assert(this.getStatus !== undefined );
-        assert(this.$evo !== undefined && this.$evo.label == "EVO");
+        this.label = 'LOCATION';
+        assert(this.gateways !== undefined, 'Location ohne gateways');
     }
-    
-    //---------------------------------------------------------
-    /**
-     * Fetches the status of the devices at the location, and merges the data
-     * with the installation data.
-     * 
-     * It may also set evo.structure_error if we encounter hardware in the
-     * status that isn't known. We should re-init if this happens.
-     * 
-     * @param {bool} quick - don't fetch schedules
-     * @returns {unresolved}
-     */
+
     async getStatus(quick) {
-        let uri = HONEYWELL + `WebApi/emea/api/v1/location/${this.locationInfo.locationId}/status?includeTemperatureControlSystems=True`;
-        //console.log(`Status Fetch from ${uri}`);
-        this.$status = await req({
-            method:'GET',
-            uri: uri,
-            headers: await this.$evo.headers(),
-            json: true
+        const locationId = this.locationInfo && this.locationInfo.locationId;
+        if (locationId === undefined) throw new BadStructure('Location hat keine locationId.');
+        const uri = apiUrl(`/location/${encodeURIComponent(locationId)}/status?includeTemperatureControlSystems=True`);
+        this.$status = await this.$evo._api({
+            method: 'GET', uri, headers: await this.$evo.headers()
         });
-        
-        //this.$evo.log.info(JSON.stringify(this.$status));
-        //
-        // merge the status into installation data
-        for(let gws of this.$status.gateways) {
-            let gw = this.gatewayById(gws.gatewayId, false);
-            if(!gw) {
-                this.$evo.setStructureError(`Unknown gateway in status ${gws.gatewayId}`);
+
+        for (const gatewayStatus of (this.$status.gateways || [])) {
+            const gateway = this.gatewayById(gatewayStatus.gatewayId, false);
+            if (!gateway) {
+                this.$evo.setStructureError(`Unknown gateway in status ${gatewayStatus.gatewayId}`);
                 continue;
             }
-                
-            gw.$status = gws;
-            
-            for(let css of gws.temperatureControlSystems) {
-                let cs = gw.controlSystemById(css.systemId, false);
-                if(!cs) {
-                    this.$evo.setStructureError(`Unknown Control System in status ${css.systemId}`);
+            gateway.$status = gatewayStatus;
+
+            for (const systemStatus of (gatewayStatus.temperatureControlSystems || [])) {
+                const system = gateway.controlSystemById(systemStatus.systemId, false);
+                if (!system) {
+                    this.$evo.setStructureError(`Unknown Control System in status ${systemStatus.systemId}`);
                     continue;
                 }
-                cs.$status = css;
-                
-                for(let zs of css.zones) {
-                    let z = cs.zoneById(zs.zoneId, false);
-                    if(!z) {
-                        this.$evo.setStructureError(`Unknown Zone in status ${zs.zoneId}`);
+                system.$status = systemStatus;
+
+                for (const zoneStatus of (systemStatus.zones || [])) {
+                    const zone = system.zoneById(zoneStatus.zoneId, false);
+                    if (!zone) {
+                        this.$evo.setStructureError(`Unknown Zone in status ${zoneStatus.zoneId}`);
                         continue;
                     }
-                    z.status = zs; // note no $ prefix
-
-                    if(!quick)
-                        await z.getSchedule();
+                    zone.status = zoneStatus;
+                    if (!quick) await zone.getSchedule();
                 }
             }
         }
-            
         return this.$status;
     }
-    //---------------------------------------------------------
-    /**
-     * Find a gateway by id
-     * @param {string} gid 
-     * @param {boolean} mandatory Set true to throw BadStructure if absent,
-     *                  otherwise return undefined.
-     * @returns gateway or undefined
-     */
-    gatewayById(gid, mandatory=false) {
-        for(let gw of this.gateways)
-            if(gw.id() === gid)
-                return gw;
-        
-        if(mandatory)
-            throw new BadStructure(`No gateway [${gid}]`);
-    }
-    //---------------------------------------------------------
-    *_gateways()
-    {
-        for(let gw of this.gateways)
-            yield gw;
-    }
-    //---------------------------------------------------------
-    name() { return this.locationInfo.name; }
-    //---------------------------------------------------------
-    /**
-     * Do an operation set by a JSON-formatted string.
-     * In this case, they are applied to all controllers.
-     * @param {json} cmd 
-     */
-    async doSystemCommand(cmd) {
-        if( typeof cmd == "string")            
-            cmd = JSON.parse(cmd);
 
-        for(let gw of this.gateways)
-            for(let cs of gw.temperatureControlSystems)
-                await cs.doSystemCommand(cmd);
+    gatewayById(id, mandatory = false) {
+        for (const gateway of (this.gateways || [])) {
+            if (gateway.id() === id) return gateway;
+        }
+        if (mandatory) throw new BadStructure(`No gateway [${id}]`);
+        return undefined;
     }
-    //---------------------------------------------------------
 
-};
-//============================================================
-/**
- * Extend gateway with some methods
- */
+    *_gateways() { for (const gateway of (this.gateways || [])) yield gateway; }
+    name() { return this.locationInfo && this.locationInfo.name; }
+
+    async doSystemCommand(command) {
+        if (typeof command === 'string') command = JSON.parse(command);
+        for (const gateway of (this.gateways || [])) {
+            for (const system of (gateway.temperatureControlSystems || [])) {
+                await system.doSystemCommand(command);
+            }
+        }
+    }
+}
+
 class Gateway {
-    constructor(loc, pjso) {
-        Object.assign(this, pjso);
-        // $ prefix allows us to filter refs out
-        this.$location = loc;
-        this.$evo = loc.$evo;
-        assert(this.$evo !== undefined && this.$evo.label == "EVO");
+    constructor(location, data) {
+        Object.assign(this, data);
+        this.$location = location;
+        this.$evo = location.$evo;
+        assert(this.$evo && this.$evo.label === 'EVO');
     }
-    
-    //---------------------------------------------------------
-    id() {
-        return this.gatewayInfo.gatewayId;
+    id() { return this.gatewayInfo && this.gatewayInfo.gatewayId; }
+    controlSystemById(id, mandatory = false) {
+        for (const system of (this.temperatureControlSystems || [])) {
+            if (system.id() === id) return system;
+        }
+        if (mandatory) throw new BadStructure(`No controlsystem [${id}]`);
+        return undefined;
     }
-    
-    //---------------------------------------------------------
-    controlSystemById(csid, mandatory=false){
-        for(let cs of this.temperatureControlSystems)
-            if(cs.id()===csid)
-                return cs;
-        
-        if(mandatory)
-            throw new BadStructure(`No controlsystem [${csid}]`);
-    }
-    //---------------------------------------------------------
-    *systems() {
-        for(let cs of this.temperatureControlSystems) 
-            yield cs;
-    }
-    //---------------------------------------------------------
-};
-//============================================================
-/**
- * Extend Temperature control system with some methods
- */
+    *systems() { for (const system of (this.temperatureControlSystems || [])) yield system; }
+}
+
 class TemperatureControlSystem {
-    constructor(gateway, pjso)  {
-        Object.assign(this, pjso);
-        // $ prefix allows us to filter refs out
+    constructor(gateway, data) {
+        Object.assign(this, data);
         this.$gateway = gateway;
         this.$evo = gateway.$evo;
-        assert(this.$evo !== undefined && this.$evo.label == "EVO");
+        assert(this.$evo && this.$evo.label === 'EVO');
     }
-    //-------------------------------------------------
-    /**
-     * Make an appropriate zone object
-     * @param {int} i Index of zone
-     * @returns {HeatZone}
-     */
-    makeZoneObject(i)
-    {
-        // I don't have examples for anything else, right now
-        // but presumably there /could/ be one day
-        return new HeatZone(this, this.zones[i]);
+
+    makeZoneObject(index) { return new HeatZone(this, this.zones[index]); }
+    id() { return this.systemId; }
+
+    zoneByName(name, mandatory = false) {
+        for (const zone of (this.zones || [])) {
+            if (zone.name === name) return zone;
+        }
+        if (mandatory) throw new BadStructure(`No zone named [${name}]`);
+        return undefined;
     }
-    //-------------------------------------------------
-    id() {
-        return this.systemId;
+
+    zoneById(id, mandatory = false) {
+        for (const zone of (this.zones || [])) {
+            if (zone.zoneId === id) return zone;
+        }
+        if (mandatory) throw new BadStructure(`No zone with id [${id}]`);
+        return undefined;
     }
-    //-------------------------------------------------
-    zoneByName(name, mandatory=false) {
-        for(let z of this.zones ) {
-            if(z.name===name)
-                return z;
-            
-        if(mandatory)
-            throw new BadStructure(`No zone named [${name}]`);
-        }        
-    }
-    //-------------------------------------------------
-    zoneById(zid, mandatory=false) {
-        assert(this.zones);
-        for(let z of this.zones ) {
-            // console.log(`Zone ${z.name} ${z.zoneId}`);
-            if(z.zoneId===zid)
-                return z;
-        }    
-        
-        if(mandatory)
-            throw new BadStructure(`No zone with id [${zid}]`);
-    }
-    //-------------------------------------------------
-    *_zones() {
-        for(let z of this.zones ) 
-            yield z;
-    }
-    //-------------------------------------------------
-    /**
-     * Set system mode
-     * @param {string} mode Mode to set: Auto, AutoWithReset, 
-     *                      Custom, AutoWithEco, Away, DayOff
-     *                      or HeatingOff
-     * @param {time} until 
-     */
+
+    *_zones() { for (const zone of (this.zones || [])) yield zone; }
+
     async setMode(mode, until) {
-
-        if(until) {
-            if(until instanceof Date)
-                until = until.toUTCString();
-
-            //ft = `${until.getFullYear()}:${until.getMonth()}:${until.getDay()}T00:00:00Z`;
-            var body = { 'SystemMode':mode, "TimeUntil": until, 'Permanent' : false };
-        } else {
-            var body = { 'SystemMode':mode, 'Permanent' : true }            
-        }
-            
-        
-        let headers = await this.$evo.headers(true); 
-        
-        let uri = HONEYWELL + `WebAPI/emea/api/v1/temperatureControlSystem/${this.id()}/mode`;
-        //console.log(`Mode  put to ${uri}`);
-        this.$status = await req({
-            method:'PUT',
-            uri: uri,
-            headers: headers,
-            json: body
+        const body = until
+            ? { SystemMode: mode, TimeUntil: until instanceof Date ? until.toISOString() : until, Permanent: false }
+            : { SystemMode: mode, Permanent: true };
+        const uri = apiUrl(`/temperatureControlSystem/${encodeURIComponent(this.id())}/mode`);
+        this.$status = await this.$evo._api({
+            method: 'PUT', uri, headers: await this.$evo.headers(true), body
         });
-
-        if(this.$evo.onCommand) await this.$evo.onCommand({
-            "cmd":"setmode", 
-            "until":until, 
-            "system": this
-        })
-    }
-    //------------------------------------------------------------------
-    /**
-     * Set to normal, Auto mode, except if in permenant override
-     */
-    async setModeNormal(until) { await this.setMode('Auto', until); }
-
-    /**
-     * Set to Auto, even if in permenant override
-     */
-    async setModeReset(until) { await this.setMode('AutoWithReset', until); }
-
-    
-    async setModeCustom(until) { await this.setMode('Custom', until); }
-    async setModeEco(until) { await this.setMode('AutoWithEco', until); }
-    async setModeAway(until) { await this.setMode('Away', until); }
-    async setModeDayOff(until) { await this.setMode('DayOff', until); }
-    async setModeOff(until) { await this.setMode('HeatingOff', until); }
-    //------------------------------------------------------------------
-    /**
-     * Do an operation set by a JSON-formatted string.
-     * @param {json} cmdjson 
-     */
-    async doSystemCommand(cmd) {
-        if( typeof cmd == "string")            
-            cmd = JSON.parse(cmd);
-        switch(cmd.command) {
-            case "setmode":
-                await this.setMode(cmd.mode, cmd.until);
-                break;
-
-            default:
-                throw new Error(`Unsupported TemperatureController command [${cmd.command}]`);
+        if (this.$evo.onCommand) {
+            await this.$evo.onCommand({ cmd: 'setmode', until, system: this });
         }
     }
-    //------------------------------------------------------------------
 
-};
-//============================================================
-class ZoneBase {
-    constructor(sys)  {
-        this.$system = sys;
-        this.$evo = sys.$evo;
-        assert(this.$evo !== undefined && this.$evo.label == "EVO");
+    async setModeNormal(until) { return this.setMode('Auto', until); }
+    async setModeReset(until) { return this.setMode('AutoWithReset', until); }
+    async setModeCustom(until) { return this.setMode('Custom', until); }
+    async setModeEco(until) { return this.setMode('AutoWithEco', until); }
+    async setModeAway(until) { return this.setMode('Away', until); }
+    async setModeDayOff(until) { return this.setMode('DayOff', until); }
+    async setModeOff(until) { return this.setMode('HeatingOff', until); }
+
+    async doSystemCommand(command) {
+        if (typeof command === 'string') command = JSON.parse(command);
+        switch (command.command) {
+            case 'setmode': return this.setMode(command.mode, command.until);
+            default: throw new Error(`Unsupported TemperatureController command [${command.command}]`);
+        }
     }
-    //------------------------------------------------------------------
-    /**
-     * return compact status of zone
-     * @returns {undefined|nm$_evo.HeatZone.state.evoAnonym$3}
-     */
+}
+
+class ZoneBase {
+    constructor(system) {
+        this.$system = system;
+        this.$evo = system.$evo;
+        assert(this.$evo && this.$evo.label === 'EVO');
+    }
+
     state() {
-        if(!this.status)
-            return {                
-                temperature: undefined,
-                isAvailable: undefined,
-                setpoint: undefined,
-                setpointMode: undefined,
-                faults: undefined
-            };
-        
+        if (!this.status) {
+            return { temperature: undefined, isAvailable: undefined, setpoint: undefined, setpointMode: undefined, faults: undefined };
+        }
+        const temperatureStatus = this.status.temperatureStatus || {};
+        const setpointStatus = this.status.setpointStatus || {};
         return {
-            schedule:     this.$schedule,
-            temperature:  this.status.temperatureStatus.temperature,
-            isAvailable:  this.status.temperatureStatus.isAvailable,
-            setpoint:     this.status.setpointStatus.targetHeatTemperature,
-            setpointMode: this.status.setpointStatus.setpointMode,
-            until:        this.status.setpointStatus.until,
-            faults:       this.status.activeFaults
+            schedule: this.$schedule,
+            temperature: temperatureStatus.temperature,
+            isAvailable: temperatureStatus.isAvailable,
+            setpoint: setpointStatus.targetHeatTemperature,
+            setpointMode: setpointStatus.setpointMode,
+            until: setpointStatus.until,
+            faults: this.status.activeFaults
         };
     }
-    //------------------------------------------------------------------
-    getURI() {
-        return HONEYWELL + `WebAPI/emea/api/v1/${this.zone_type}/${this.zoneId}`;
-    }
-    //------------------------------------------------------------------
-    /**
-     * Get the schedule for the zone into $schedule, also return it.
-     */
-    async getSchedule()
-    {
-        let headers = await this.$evo.headers(); 
-        let uri = this.getURI()+"/schedule";
-        console.log(`Schedule get ${uri}`);
-        let schedule = await req({
-            method:'GET',
-            uri: uri,
-            headers: headers,
-            json: true
-        });
 
+    getURI() {
+        return apiUrl(`/${this.zone_type}/${encodeURIComponent(this.zoneId)}`);
+    }
+
+    async getSchedule() {
+        const uri = `${this.getURI()}/schedule`;
+        const schedule = await this.$evo._api({
+            method: 'GET', uri, headers: await this.$evo.headers()
+        });
         this.$schedule = new DailySchedule(schedule, this.$evo.log);
-        
         return this.$schedule;
     }
-    //------------------------------------------------------------------
-    async setSchedule(sch) {
-        if( typeof sch == "string")            
-            sch = JSON.parse(sch);
 
-        let headers = await this.$evo.headers(true); 
-        
-        let uri = this.getURI()+"/schedule";
-        this.$evo.log.info(`Schedule Put ${uri}`);
-        this.$status = await req({
-            method:'PUT',
-            uri: uri,
-            headers: headers,
-            json: sch
+    async setSchedule(schedule) {
+        if (typeof schedule === 'string') schedule = JSON.parse(schedule);
+        const uri = `${this.getURI()}/schedule`;
+        await this.$evo._api({
+            method: 'PUT', uri, headers: await this.$evo.headers(true), body: schedule
         });
-        
-        if(this.$evo.onCommand) await this.$evo.onCommand({
-            "cmd":"setschedule", 
-            "zone": this
-        })
-
-        this.$schedule = new DailySchedule(sch, this.$evo.log);
-
+        if (this.$evo.onCommand) await this.$evo.onCommand({ cmd: 'setschedule', zone: this });
+        this.$schedule = new DailySchedule(schedule, this.$evo.log);
     }
-    //------------------------------------------------------------------
-    /**
-     * Do an operation set by a JSON-formatted string
-     * @param {json} cmd 
-     */
-    async doZoneCommand(cmd) {
-        if( typeof cmd == "string")            
-            cmd = JSON.parse(cmd);
 
-        switch(cmd.command) {
-
-            case "SetSchedule":
-                await this.setSchedule(cmd.schedule);
-                break;
-
-            default:
-                throw new Error(`Unsupported Zone command [${cmd.command}]`);
+    async doZoneCommand(command) {
+        if (typeof command === 'string') command = JSON.parse(command);
+        switch (command.command) {
+            case 'SetSchedule': return this.setSchedule(command.schedule);
+            default: throw new Error(`Unsupported Zone command [${command.command}]`);
         }
     }
-    //------------------------------------------------------------------
 }
-//============================================================
-/**
- * Extend HeatingZone
- */
+
 class HeatZone extends ZoneBase {
-    constructor(sys, pjso)  {
-        super(sys);
-        Object.assign(this, pjso);
+    constructor(system, data) {
+        super(system);
+        Object.assign(this, data);
         this.zone_type = 'temperatureZone';
-        assert(this.$evo !== undefined && this.$evo.label == "EVO");
+        assert(this.$evo && this.$evo.label === 'EVO');
     }
-    //------------------------------------------------------------------
-    /**
-     * Do an operation set by a JSON-formatted string
-     * @param {json} cmd 
-     */
-    async doZoneCommand(cmd) {
-        if( typeof cmd == "string")            
-            cmd = JSON.parse(cmd);
 
-        switch(cmd.command) {
-            case "Override":
-                await this.setTemperature(cmd.setpoint, cmd.until);
-                break;
-
-            case "CancelOverride":
-                await this.cancelTemperatureOverride();
-                break;
-
-            default:
-                await super.doZoneCommand(cmd);
-                break;
+    async doZoneCommand(command) {
+        if (typeof command === 'string') command = JSON.parse(command);
+        switch (command.command) {
+            case 'Override': return this.setTemperature(command.setpoint, command.until);
+            case 'CancelOverride': return this.cancelTemperatureOverride();
+            default: return super.doZoneCommand(command);
         }
     }
-    //------------------------------------------------------------------
-    /**
-     * Set temperature override.
-     * @param {Number} temperature Temperature to set
-     * @param {Date?} until         Time to set till, undefined for perm or "next-switchpoint"
-     */
+
     async setTemperature(temperature, until) {
-        const data = {
-                    "HeatSetpointValue": temperature
-                    };
-
-        if(until=="next-switchpoint") {
-            let i = this.$schedule.iterator();
-            until = i.switchpointDateTime();
-        }                    
-
-        if(until) {
-            data.SetpointMode = "TemporaryOverride";
+        const data = { HeatSetpointValue: temperature };
+        if (until === 'next-switchpoint') {
+            if (!this.$schedule) await this.getSchedule();
+            const iterator = this.$schedule.iterator();
+            until = iterator.switchpointDateTime();
+            if (!until) throw new Error('Kein nächster Schaltpunkt im Zeitplan gefunden.');
+        }
+        if (until) {
+            data.SetpointMode = 'TemporaryOverride';
             data.TimeUntil = Evo.toDateTimeString(until);
         } else {
-            data.SetpointMode = "PermanentOverride";
+            data.SetpointMode = 'PermanentOverride';
         }
-
-        await this._setHeatSetpoint(data);        
+        return this._setHeatSetpoint(data);
     }
 
-    //------------------------------------------------------------------
     async _setHeatSetpoint(data) {
-        const uri = this.getURI() + "/heatSetpoint";
-        const headers = await this.$evo.headers(true);
-        this.$evo.log.info(`${JSON.stringify(data)} >>  ${uri}` );
-        try
-        {
-            const status = await req({
-                method:'PUT',
-                uri: uri,
-                headers: headers,
-                json: data
+        const uri = `${this.getURI()}/heatSetpoint`;
+        await this.$evo._api({
+            method: 'PUT', uri, headers: await this.$evo.headers(true), body: data
+        });
+        if (this.$evo.onCommand) {
+            await this.$evo.onCommand({
+                cmd: 'setheatsetpoint', mode: data.SetpointMode,
+                until: data.TimeUntil, zone: this
             });
-
-            if(this.$evo.onCommand) await this.$evo.onCommand({
-                "cmd":  "setheatsetpoint", 
-                "mode": data.SetpointMode,
-                "until": data.TimeUntil, 
-                "zone": this
-            })
-    
-        } catch(e) {
-            throw Error( `PUT failed to ${uri} reason=${e}\n data=${JSON.stringify(data)}\n hdr=${headers}` )
         }
-
     }
-    //------------------------------------------------------------------
-    async cancelTemperatureOverride(sch) {
-        const data = {
-                "SetpointMode": "FollowSchedule",
-                "HeatSetpointValue": 0.0
-                };
 
-        await this._setHeatSetpoint(data);        
+    async cancelTemperatureOverride() {
+        return this._setHeatSetpoint({
+            SetpointMode: 'FollowSchedule',
+            HeatSetpointValue: 0.0
+        });
     }
-    //------------------------------------------------------------------
 }
-//============================================================
-/*
-{"dailySchedules":[
-    {
-        "dayOfWeek":"Monday",
-        "switchpoints":[
-            {"heatSetpoint":21,"timeOfDay":"08:00:00"},
-            {"heatSetpoint":16,"timeOfDay":"17:30:00"},
-            {"heatSetpoint":5,"timeOfDay":"22:30:00"}
-            ]
-    },
-    ETC
-]
-}
-*/
 
-//============================================================
 class ScheduleIterator {
-    constructor(sched, atime, log) {
-        let time = new Date(atime.getTime());
-        this.schedule = sched;
-        let seconds = time.getHours()*3600
-                        + time.getMinutes()*60
-                        + time.getSeconds()
-                        ;
-
+    constructor(schedule, atime, log) {
+        const time = new Date(atime.getTime());
+        this.schedule = schedule;
+        const seconds = time.getHours() * 3600 + time.getMinutes() * 60 + time.getSeconds();
         this.baseday = new Date(atime.getTime());
-        this.baseday.setHours(0,0,0,0);
-
-        this.dow = (time.getDay()+6) % 7;  // js days start Sunday=0
+        this.baseday.setHours(0, 0, 0, 0);
+        this.dow = (time.getDay() + 6) % 7;
         this.index = 0;
         this.dayoffset = 0;
         this.invalid = false;
         this.$log = log;
         this.adjust();
-        while(this.dayoffset==0 && this.switchpoint().secondsInDay() < seconds)
+        let guard = 0;
+        while (!this.invalid && this.dayoffset === 0 && this.switchpoint().secondsInDay() < seconds) {
             this.next();
+            if (++guard > 100) throw new Error('Invalid schedule: too many switchpoints.');
+        }
     }
 
-    //-------------------------------------------------------------------------
     adjust() {
-        let c =0;
-        while(!this.invalid) {
-            //this.$log.info(`adj dow=${this.dow} ix=${this.index} of ${this.schedule.dailySchedules[this.dow].switchpoints.length}`);
-
-            if(this.index < this.schedule.dailySchedules[this.dow].switchpoints.length)
-                return;
-
-            if(++c==8) {
+        let count = 0;
+        while (!this.invalid) {
+            const day = this.schedule.dailySchedules[this.dow];
+            if (day && this.index < day.switchpoints.length) return;
+            if (++count >= 8) {
                 this.invalid = true;
-                throw Error("No schedule found!");
-                break;
+                throw new Error('No schedule found!');
             }
-                
-
             ++this.dayoffset;
-            ++this.dow;
-            if(this.dow>6)
-                this.dow=0;
+            this.dow = (this.dow + 1) % 7;
             this.index = 0;
         }
     }
 
-    //-------------------------------------------------------------------------
-    /**
-     * Advance to next switchpoint
-     */
-    next() {
-        ++this.index;
-        this.adjust();
-    }
+    next() { ++this.index; this.adjust(); }
 
-    //-------------------------------------------------------------------------
-    /**
-     * Get current switchpoint
-     */
     switchpoint() {
-        if(this.invalid) 
-            return undefined;
-
-        return this.schedule.dailySchedules[this.dow].switchpoints[this.index];
+        if (this.invalid) return undefined;
+        const day = this.schedule.dailySchedules[this.dow];
+        return day && day.switchpoints[this.index];
     }
 
-    //-------------------------------------------------------------------------
-    /**
-     * get actual datetime of switchpoint
-     */
     switchpointDateTime() {
-        if(this.invalid) 
-            return undefined;
-
-        let sp = this.switchpoint();
-        let dt = new Date(this.baseday.getTime());
-        dt.setDate( dt.getDate() + this.dayoffset);
-        dt.setSeconds(sp.secondsInDay());
-        return dt;
+        if (this.invalid) return undefined;
+        const point = this.switchpoint();
+        const date = new Date(this.baseday.getTime());
+        date.setDate(date.getDate() + this.dayoffset);
+        date.setSeconds(point.secondsInDay());
+        return date;
     }
-    //-------------------------------------------------------------------------
-
 }
-//============================================================
+
 class DailySchedule {
     constructor(raw, log) {
         this.$log = log;
-        if(raw) {
+        if (raw) {
             Object.assign(this, raw);
-            for(let i=0; i<this.dailySchedules.length; ++i) {
-                this.dailySchedules[i] = new DaySchedule(this.dailySchedules[i]);
-            }
+            this.dailySchedules = (this.dailySchedules || []).map(day => new DaySchedule(day));
         } else {
-            this.dailySchedules = [];
-            for (const day of DailySchedule.days() ) {
-                this.dailySchedules.push(new DaySchedule(null,day));                    
-            }
+            this.dailySchedules = DailySchedule.days().map(day => new DaySchedule(null, day));
         }
     }
-    //---------------------------------------------------------
+
     static days() {
-        return [ "Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+        return ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
     }
 
-    //---------------------------------------------------------
-    /**
-     * Get a day's schedule by index or by name. Monday is day 0
-     * @param {*} ixOrName 
-     */
-    getDay(ixOrName) {
-        if(typeof ixOrName == "number")
-            return this.dailySchedules[ixOrName];
+    getDay(indexOrName) {
+        if (typeof indexOrName === 'number') return this.dailySchedules[indexOrName];
+        return this.dailySchedules.find(day =>
+            indexOrName.localeCompare(day.dayOfWeek, undefined, { sensitivity: 'base' }) === 0
+        );
+    }
 
-        for (const dsch of this.dailySchedules) {
-            if(ixOrName.localeCompare(dsch.dayOfWeek, undefined, { sensitivity: 'base' }) === 0)
-                return dsch;
-        }
-    }
-    //---------------------------------------------------------
-    /**
-     * Unbounded Iterate switchpoints starting at next one.
-     * @param {date} time 
-     */
-    iterator(time) {
-        return new ScheduleIterator(this, time || new Date(), this.$log);
-    }
-    //---------------------------------------------------------
+    iterator(time) { return new ScheduleIterator(this, time || new Date(), this.$log); }
 }
-//============================================================
+
 class DaySchedule {
-    //---------------------------------------------------------
-    constructor(raw,dow)
-    {
-        if(raw) {
+    constructor(raw, dayOfWeek) {
+        if (raw) {
             Object.assign(this, raw);
-            for(let i=0; i<this.switchpoints.length; ++i) {
-                this.switchpoints[i] = new HeatSwitchpoint(this.switchpoints[i]);
-            }
-
+            this.switchpoints = (this.switchpoints || []).map(point => new HeatSwitchpoint(point));
         } else {
-            this.switchpoints=[];
-            this.dayOfWeek = dow;
+            this.switchpoints = [];
+            this.dayOfWeek = dayOfWeek;
         }
     }
-    //---------------------------------------------------------
-    /**
-     * Create a new switch point, and add to this.switchpoints
-     * @param {number} value 
-     * @param {string} timeOfDay 
-     */
-    createSwitchPoint(value,timeOfDay) {
-        let swp = new HeatSwitchpoint(null, value,timeOfDay);
-        this.switchpoints.push(swp);
-        this.rationaliseSwitchpoints(swp);
-        return swp;
-    }
-    //---------------------------------------------------------
-    /**
-     * Sort the switchpoints, eliminating duplicate times.
-     * 
-     * You can pass any number of "keeper" switchpoints which
-     * will be used in case of a duplicated time.
-     * 
-     */
-    rationaliseSwitchpoints() {
-        this.switchpoints.sort( (a,b) => a.timeOfDay.localeCompare(b.timeOfDay) );
 
-        for(let i=this.switchpoints.length-2; i>=0; --i) {
-            let a = this.switchpoints[i];
-            let b = this.switchpoints[i+1];
-            if( a.timeOfDay.localeCompare(b.timeOfDay) == 0) {
-                // they are equal?
-                if(arguments && arguments.indexOf(a) != -1 ) {
-                    // keep a
-                    this.switchpoints.splice(i+1,1);
-                } else {
-                    // keep b
-                    this.switchpoints.splice(i,1);
-                }
+    createSwitchPoint(value, timeOfDay) {
+        const point = new HeatSwitchpoint(null, value, timeOfDay);
+        this.switchpoints.push(point);
+        this.rationaliseSwitchpoints(point);
+        return point;
+    }
+
+    rationaliseSwitchpoints() {
+        this.switchpoints.sort((a, b) => a.timeOfDay.localeCompare(b.timeOfDay));
+        for (let i = this.switchpoints.length - 2; i >= 0; --i) {
+            const a = this.switchpoints[i];
+            const b = this.switchpoints[i + 1];
+            if (a.timeOfDay === b.timeOfDay) {
+                if (Array.from(arguments).includes(a)) this.switchpoints.splice(i + 1, 1);
+                else this.switchpoints.splice(i, 1);
             }
         }
     }
-    //---------------------------------------------------------
 }
-//============================================================
+
 class HeatSwitchpoint {
     constructor(raw, value, timeOfDay) {
-        if(raw) {
-            Object.assign(this, raw);
-        } else {
-            this.heatSetpoint = value || 5.0;
-            this.timeOfDay = timeOfDay || "00:00:00";
+        if (raw) Object.assign(this, raw);
+        else {
+            this.heatSetpoint = value === undefined ? 5.0 : value;
+            this.timeOfDay = timeOfDay || '00:00:00';
         }
     }
 
-    /**
-     * Set or Return switchpoint as number of seconds in the day
-     */
     secondsInDay(set) {
-        if(set==undefined) {
-            let frags = this.timeOfDay.split(":");
-            return Number(frags[0])*3600 + Number(frags[1])*60+Number(frags[2]);
+        if (set === undefined) {
+            const parts = this.timeOfDay.split(':').map(Number);
+            return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
         }
-        const sec = set % 60;
-        set = Math.floor(set/60);
-        const min = set % 60;
-        const hr = Math.floor(set/60);
-        this.timeOfDay = sprintf.sprintf("%02d:%02d:%02d", hr, min, sec);
+        const seconds = set % 60;
+        set = Math.floor(set / 60);
+        const minutes = set % 60;
+        const hours = Math.floor(set / 60);
+        this.timeOfDay = sprintf.sprintf('%02d:%02d:%02d', hours, minutes, seconds);
     }
 }
-//============================================================
-module.exports = Evo;
 
+module.exports = Evo;
